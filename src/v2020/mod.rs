@@ -329,6 +329,65 @@ pub fn cut_gear(
 }
 
 ///
+/// Original 4.0.1 slice-based cut routine, retained **only** for the
+/// interleaved A/B benchmark so old and new can be timed in one process. Not
+/// part of the public API; gated behind the `internal-bench` feature.
+///
+#[cfg(feature = "internal-bench")]
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn cut_gear_legacy(
+    source: &[u8],
+    min_size: usize,
+    avg_size: usize,
+    max_size: usize,
+    mask_s: u64,
+    mask_l: u64,
+    mask_s_ls: u64,
+    mask_l_ls: u64,
+    gear: &[u64],
+    gear_ls: &[u64],
+) -> (u64, usize) {
+    let mut remaining = source.len();
+    if remaining <= min_size {
+        return (0, remaining);
+    }
+    let mut center = avg_size;
+    if remaining > max_size {
+        remaining = max_size;
+    } else if remaining < center {
+        center = remaining;
+    }
+    let mut index = min_size / 2;
+    let mut hash: u64 = 0;
+    while index < center / 2 {
+        let a = index * 2;
+        hash = (hash << 2).wrapping_add(gear_ls[source[a] as usize]);
+        if (hash & mask_s_ls) == 0 {
+            return (hash, a);
+        }
+        hash = hash.wrapping_add(gear[source[a + 1] as usize]);
+        if (hash & mask_s) == 0 {
+            return (hash, a + 1);
+        }
+        index += 1;
+    }
+    while index < remaining / 2 {
+        let a = index * 2;
+        hash = (hash << 2).wrapping_add(gear_ls[source[a] as usize]);
+        if (hash & mask_l_ls) == 0 {
+            return (hash, a);
+        }
+        hash = hash.wrapping_add(gear[source[a + 1] as usize]);
+        if (hash & mask_l) == 0 {
+            return (hash, a + 1);
+        }
+        index += 1;
+    }
+    (hash, remaining)
+}
+
+///
 /// Inner cut routine over fixed-size GEAR arrays.
 ///
 /// Identical math and cut points to the original `cut_gear`. The change is
