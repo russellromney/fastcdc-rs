@@ -26,6 +26,7 @@ internal-bench = []
 aes = "0.9.0"
 blake3 = "1.8.4"
 criterion = "0.5"
+sha2 = "0.10"
 byteorder = "1.4.3"
 clap = { version = "4.2.1", features = ["cargo"] }
 ctr = "0.10.0"
@@ -53,6 +54,13 @@ required-features = ["tokio"]
 [[bench]]
 name = "chunking"
 path = "benches/chunking.rs"
+harness = false
+
+# Fused chunk+hash vs two-pass (chunk, then hash). Shows whether hashing while
+# the chunk is still hot in cache beats a separate hashing pass.
+[[bench]]
+name = "fuse"
+path = "benches/fuse.rs"
 harness = false
 
 # Interleaved old-vs-new A/B comparison. Requires the internal-bench feature:

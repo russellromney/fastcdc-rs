@@ -416,3 +416,44 @@ the largest io_uring payoff in cinch is almost certainly the *storage/sync data
 plane* (page fetches, WAL shipping — many concurrent kernel-mediated I/Os),
 where the paper's syscall/copy critique bites hardest. Chunking is a small
 CPU-bound consumer at the end of that pipe.
+
+---
+
+## 9. Experiment: fuse chunking with per-chunk hashing (`benches/fuse.rs`)
+
+A content-addressed store hashes every chunk. Question: hash each chunk the
+instant its boundary is found (while hot in L1, via `Chunker::for_each_chunk`),
+or scan first and hash in a second pass? Interleaved min-of-31, laptop, 32 MiB
+random (ratios are trustworthy; the single-shot hash-only figures are rough):
+
+```
+16 KiB chunks:   BLAKE3  two-pass 451 -> fused 715 MiB/s   1.58x
+                 SHA-256 two-pass 220 -> fused 221 MiB/s   1.01x
+1 MiB chunks:    BLAKE3  two-pass 788 -> fused 791 MiB/s   1.00x
+                 SHA-256                                    1.00x
+reference:       chunk-only 957 (16K) / 1944 (1M);  hash-only BLAKE3 ~770-1316
+```
+
+Findings:
+- **Fusing wins big (1.58x) only when both hold:** the hash is fast
+  (BLAKE3, memory-bound) *and* the chunk fits in L1 (~16 KiB). Then the second
+  pass would re-read the chunk from L2/L3; fusing hashes it while still in L1.
+- **No benefit for 1 MiB chunks** — a 1 MiB chunk is far bigger than L1, so its
+  front is already evicted by the time the boundary is found; both paths re-read.
+- **No benefit when the hash is the bottleneck** (SHA-256 here). Which surfaces
+  the real headline:
+- **SHA-256 is running unaccelerated at ~134 MiB/s.** The `sha2` crate fell back
+  to the portable implementation (no aarch64 crypto / x86 SHA-NI on this build).
+  In any SHA-256 content-addressing pipeline that 134 MiB/s dwarfs everything —
+  the chunker's ~2 GiB/s and even BLAKE3's ~1 GiB/s are irrelevant next to it.
+  **Enabling SHA hardware (sha2 `asm`/intrinsics) is a >10x lever and matters far
+  more than any chunk-loop tweak.** This is a cinch-integration concern (the
+  library doesn't hash), but it's the single most important thing this whole
+  spike found about the *end-to-end* cost.
+- **Takeaway for cinch:** in a chunk+hash pipeline, **hashing dominates**, not
+  chunking. Pick a SIMD hash (BLAKE3, or hardware SHA), use small (~16 KiB)
+  chunks, and fuse hashing into `for_each_chunk`. The ~12% chunk-loop win is real
+  but small next to getting the hash right.
+
+(Numbers are directional laptop figures; confirm on the Fly dedicated-CPU box,
+and re-check SHA-256 with the `asm` feature enabled.)
