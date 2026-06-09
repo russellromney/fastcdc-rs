@@ -1,0 +1,11 @@
+# Throwaway one-shot benchmark app. No services; just runs the bench CMD on a
+# dedicated-CPU VM and stays up so logs can be read, then is destroyed.
+app = "cinch-fastcdc-bench"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile.bench"
+
+[[vm]]
+  size = "performance-2x"
+  memory = "4gb"

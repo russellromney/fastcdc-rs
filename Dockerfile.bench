@@ -1,0 +1,19 @@
+# One-shot benchmark image for a neutral (dedicated-CPU, Linux/x86_64)
+# environment on Fly. Builds the bench binaries at image-build time, then the
+# CMD runs them and prints results to stdout (read via `fly logs`), then sleeps
+# so the machine stays "started" for the deploy to settle.
+FROM rust:1.95-bookworm
+WORKDIR /crate
+COPY . .
+# Compile both benches up front (bench profile: opt-level=3, thin LTO, 1 CGU).
+RUN cargo bench --no-run --features internal-bench --bench ab \
+ && cargo bench --no-run --bench chunking
+CMD ["bash", "-c", "\
+  export PATH=/usr/local/cargo/bin:$PATH; \
+  echo '=== env ==='; uname -a; echo \"nproc=$(nproc)\"; \
+  echo; echo '=== A/B: old cut_gear vs patched (interleaved, one process) ==='; \
+  cargo bench --features internal-bench --bench ab; \
+  echo; echo '=== descriptive throughput (criterion) ==='; \
+  cargo bench --bench chunking -- --warm-up-time 1 --measurement-time 3 --sample-size 40 2>&1 \
+    | grep -E 'time:|thrpt:|_paths/|content/|avg_size/|versions/|new_api/|small/'; \
+  echo; echo 'BENCH_DONE'; sleep infinity"]

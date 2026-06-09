@@ -17,10 +17,15 @@ features = ["futures"]
 default = []
 tokio = ["dep:tokio", "tokio-stream", "async-stream"]
 futures = ["dep:futures"]
+# Exposes `v2020::cut_gear_legacy` (the pre-patch slice implementation) so the
+# interleaved A/B benchmark can time old vs new in a single process. Not part
+# of the public API.
+internal-bench = []
 
 [dev-dependencies]
 aes = "0.9.0"
 blake3 = "1.8.4"
+criterion = "0.5"
 byteorder = "1.4.3"
 clap = { version = "4.2.1", features = ["cargo"] }
 ctr = "0.10.0"
@@ -44,3 +49,22 @@ async-stream = { version = "0.3", optional = true }
 [[example]]
 name = "async2020"
 required-features = ["tokio"]
+
+[[bench]]
+name = "chunking"
+path = "benches/chunking.rs"
+harness = false
+
+# Interleaved old-vs-new A/B comparison. Requires the internal-bench feature:
+#   cargo bench --features internal-bench --bench ab
+[[bench]]
+name = "ab"
+path = "benches/ab.rs"
+harness = false
+required-features = ["internal-bench"]
+
+# Release-quality codegen for the benchmark binaries.
+[profile.bench]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
