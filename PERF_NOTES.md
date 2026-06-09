@@ -1,8 +1,10 @@
 # FastCDC v2020 — performance notes
 
 Notes from the work behind #44 (restore array-typed GEAR lookups in `cut_gear`;
-add `Chunker`). Scope is the `v2020` cut path only. Measured on an Apple M1 Pro
-and a dedicated-CPU x86_64 (AMD EPYC) VM, rustc 1.95, release/bench profile
+add `Chunker`). Scope is the `v2020` cut path only. Measured on two
+architectures: an Apple M1 Pro (ARM), and a dedicated-CPU x86_64 (AMD EPYC)
+VM on [Fly.io](https://fly.io) (`fly machine` / `performance` size, so a pinned
+core with no noisy neighbours). rustc 1.95, release/bench profile
 (`opt-level=3`, thin LTO, 1 codegen unit).
 
 ## 1. The change in #44, and why it helps
@@ -96,8 +98,8 @@ single criterion delta. It rests on, in decreasing order of trust:
 - the asm fact (the work provably shrank — independent of any timer);
 - the interleaved A/B (old and new run microseconds apart, alternating order, so
   drift divides out of the ratio), min-of-N (loop noise is one-sided);
-- re-running on the isolated x86 VM, where criterion CIs tightened to ±2–3% and
-  the win reproduced on a different architecture.
+- re-running on the isolated x86 Fly VM (dedicated core), where criterion CIs
+  tightened to ±2–3% and the win reproduced on a different architecture.
 
 Residual caveats: the inputs are synthetic (a seeded SplitMix64 fill), and
 `llvm-mca` is only a model — it predicts even the GEAR-check removal should be
