@@ -649,9 +649,17 @@ worse). **Recommend MinCDCHash4** (the author's robust default — MinCDC4 can
 skew sizes on adversarial input; cinch's data-integrity bar wants the robust
 one, still 3x faster than FastCDC at equal dedup).
 
-Caveats: synthetic corpus + NEON. On x86/AVX2 mincdc's lead likely grows (its
-41 GB/s is on a 9950X). Confirm on a real cinch workload sample before locking
-the choice. Full method + numbers: `third_party/cdc-bakeoff/BAKEOFF.md`.
+**x86 confirmation (Fly, AMD EPYC, AVX2):** the lead *grows* on a real server
+CPU — MinCDCHash4 **3.3–3.8x** faster than FastCDC, MinCDC4 **6.6–7.7x**, and at
+64 KiB chunks MinCDC also *wins* dedup (+1–3 pts) with lower CV. A size sweep
+(256 KiB→2 GiB) shows FastCDC flat at ~2.2 GiB/s (latency-bound, never reaches
+memory bandwidth) while MinCDC peaks at ~4 MiB (L3) then declines toward 2 GiB
+(memory-bound) — the faster algorithm hits the RAM wall first. **Profiling
+mincdc found no FastCDC-style easy win:** its AVX2 path is already expertly
+optimized (32 B/step, 2x unroll, prefetch, vectorized argmin, no bounds checks);
+the only lever is parallelism across cores (it's self-synchronizing too). Full
+method + numbers: `cinch-cloud/third_party/cdc-bakeoff/BAKEOFF.md`. Still worth a
+real cinch-data sample before locking the choice.
 
 **Bottom line of the whole effort:** the FastCDC patch is a fine, safe local win
 (~12%/core, identical cut points, shipped). But the strategically correct move
