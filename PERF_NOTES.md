@@ -85,14 +85,25 @@ so the compiler reinserts a `panic_bounds_check` on *every* table lookup, twice
 per loop iteration. The source reads `source[a]` / `source[a + 1]` were
 similarly unprovable.
 
-Noise-free evidence (emitted asm, `--emit asm -C opt-level=3`):
+Noise-free evidence (emitted asm, x86-64-v3, counting `panic_bounds_check`
+within the `cut_gear` function body):
 
 ```
-panic_bounds_check sites inside cut_gear:   8   (baseline 4.0.1)
-panic_bounds_check sites inside cut_gear:   0   (patched)
+panic_bounds_check sites inside cut_gear:   8   (baseline / cut_gear_legacy)
+panic_bounds_check sites inside cut_gear:   4   (patched)
 ```
 
-8 = {GEAR_LS, GEAR, source[a], source[a+1]} × {pre-center loop, post-center loop}.
+The original 8 = {GEAR_LS, GEAR, source[a], source[a+1]} × {pre-center loop,
+post-center loop}. The patch removes the **4 GEAR-table checks**; the **4
+source-index checks remain**.
+
+> **Correction.** An earlier draft claimed "8 → 0". That was a measurement bug:
+> an `awk` range keyed on the *inlined* `cut_gear_arr` name matched nothing, so
+> `grep -c` reported 0 on an empty range. Counting within the real `cut_gear`
+> symbol gives 8 → 4. The measured speedup (§5) is unaffected — it comes from
+> the interleaved A/B with a correctness gate, not from the check count. And per
+> §6a the remaining 4 checks are free anyway, so removing them is not worth
+> doing.
 
 ### The change
 
@@ -101,10 +112,12 @@ panic_bounds_check sites inside cut_gear:   0   (patched)
 1. `let gear: &[u64; 256] = gear.try_into().expect(...)` (same for `gear_ls`).
    The gear hash table is 256 entries by construction; non-256 input is a
    programming error and panics at the boundary instead of silently. The inner
-   loop then indexes arrays → no table bounds check.
+   loop then indexes arrays → no table bounds check. **This is the win** (4
+   checks gone).
 2. `let src = &source[..remaining];` and hoists `limit1 = center/2`,
-   `limit2 = remaining/2`. Since `center ≤ remaining`, `2*index+1 < remaining`
-   holds throughout, so `src[a]` / `src[a+1]` need no check.
+   `limit2 = remaining/2`. Intent was to also drop the `src[a]` / `src[a+1]`
+   checks, but the compiler does **not** prove `2*index+1 < remaining` here, so
+   those 4 checks remain. Kept anyway: harmless, and (§6a) free in practice.
 
 The arithmetic is byte-for-byte identical; only the *provenance* of the indices
 changed. The original loop body is retained verbatim as `cut_gear_legacy`
@@ -115,7 +128,7 @@ changed. The original loop body is retained verbatim as `cut_gear_legacy`
 - **Existing upstream tests** pin exact cut points, exact 64-bit hashes, and
   exact BLAKE3 digests for the `SekienAkashita.jpg` fixture across NC levels 0/1/3,
   seeds 0 and 666, and 16K/32K/64K parameters — for `cut()`, the iterator, and
-  `StreamCDC`. All pass unchanged (51 default-feature tests).
+  `StreamCDC`. All pass unchanged (54 default-feature tests in the fork).
 - **A/B correctness gate.** `benches/ab.rs` chunks 16–32 MiB of random, text, and
   zeros with both implementations and `assert_eq!`s the XOR-accumulated
   (length ⊕ hash) stream before timing. Identical for every case.
@@ -241,6 +254,40 @@ nothing to clean up. `target/` is git-ignored.
 
 ---
 
+## 6a. Why the loop is latency-bound (llvm-mca), and what that implies
+
+To decide whether removing the remaining 4 source checks was worth it, I ran
+`llvm-mca` (static pipeline model) on the actual inner loop for `znver3` (AMD,
+the likely Fly uarch), comparing the patched loop (4 source checks) against a
+hand-stripped loop with those checks removed:
+
+```
+                       Total Cycles (1000 iters)   uOps/cycle
+patched (4 checks)            6010                    2.83
+stripped (0 checks)           6010                    2.00
+```
+
+**Identical cycle counts.** Removing the checks drops uOps/cycle (less work per
+cycle) but not total time — the freed slots were idle anyway. The loop is
+**bound by the hash dependency chain** (`hash = (hash<<2) + G[b0]`, then
+`+ G[b1]` — each iteration's `hash` needs the previous one), not by instruction
+throughput. The bounds-check compares are independent of that chain, so they
+execute in the shadow of the latency and cost ≈0.
+
+Implications, which steer all future work:
+- **Do not chase the remaining 4 source checks** — proven 0 cycle benefit.
+- Micro-optimizing the loop body in general is a dead end; we are latency-bound,
+  not throughput- or instruction-count-bound.
+- The only ways past the ~2.2 GiB/s/core wall are to **break the chain**
+  (SIMD-parallel gear hashing, SS-CDC style — start hashing from many offsets at
+  once, since the gear hash only "remembers" the last few dozen bytes) or to
+  **stop re-reading the bytes** (fuse per-chunk hashing into the scan so the
+  bytes are hashed while still hot in L1), or to **scale across cores**.
+- Caveat: `llvm-mca` is a model. It also predicts the GEAR-check removal should
+  be near-free, yet the hardware A/B measured ~12%. Treat the *relative* "checks
+  are free" result as robust and the absolute cycle figure as approximate; where
+  model and hardware disagree, the interleaved A/B on real silicon wins.
+
 ## 6. Hostile review of measurement quality
 
 > **Update:** the laptop critique below stands, but the result was since
@@ -272,7 +319,7 @@ How the headline result defends against that noise, and the residual holes:
   time), so the min is the closest thing to the true cost. *Hole:* if the new
   code's min is reached more often by luck it could flatter slightly — but the
   medians move by the same ~13%, so it is not a min artifact.
-- **Asm is the ground truth.** 8→0 bounds checks is a fact about the binary, not
+- **Asm is the ground truth.** 8→4 bounds checks is a fact about the binary, not
   a timing. The 13% is the *consequence*; even if every wall-clock number were
   thrown out, the work provably shrank. *Hole:* fewer instructions need not mean
   faster on an out-of-order core where the bounds-check branch is perfectly
@@ -311,11 +358,10 @@ reproducible ~13% on the hottest loop in the chunker. The additive `Chunker`
 API gives CinchFS a zero-allocation per-segment hashing path when roadmap item
 #14 (content-defined chunking) lands, without committing to it now.
 
-No `unsafe` was added. The source-read bounds checks were removed by narrowing
-the slice and hoisting the loop bound — the safe way — rather than
-`get_unchecked`. A further `unsafe` pass over the inner loop was considered and
-rejected: the safe change already reaches 0 bounds checks, so `unsafe` would add
-risk for no measured gain.
+No `unsafe` was added. The 4 GEAR-table checks were removed safely via fixed
+array typing. The 4 source-index checks remain, and `unsafe` `get_unchecked`
+was considered and rejected to remove them: §6a shows they cost ~0 cycles
+(latency-bound loop), so `unsafe` would add risk for no measured gain.
 
 ---
 

@@ -390,13 +390,19 @@ pub fn cut_gear_legacy(
 ///
 /// Inner cut routine over fixed-size GEAR arrays.
 ///
-/// Identical math and cut points to the original `cut_gear`. The two changes
-/// are bounds-check-only (no behavior change):
-///   1. GEAR tables are `&[u64; 256]`, indexed by a `u8`-derived value, so the
-///      lookups carry no bounds check.
-///   2. The source is narrowed once to `&source[..remaining]`, and the loop
-///      bounds are hoisted into `limit1`/`limit2`, so `src[a]`/`src[a + 1]`
-///      are provably within the window and carry no bounds check either.
+/// Identical math and cut points to the original `cut_gear`. The change is
+/// bounds-check-only (no behavior change):
+///   - GEAR tables are `&[u64; 256]`, indexed by a `u8`-derived value, so the
+///     two table lookups per iteration carry no bounds check. This removes 4 of
+///     the 8 `panic_bounds_check` sites the original had (verified in asm).
+///
+/// The source is also narrowed once to `&source[..remaining]` with hoisted
+/// loop bounds. This does NOT eliminate the `src[a]`/`src[a + 1]` bounds checks
+/// — the compiler will not prove `2 * index + 1 < remaining` through the loop —
+/// so 4 source-index checks remain. That is fine: `llvm-mca` shows the loop is
+/// bound by the hash dependency chain (`shl` -> `add` -> `add`), so those
+/// checks land in spare execution slots and cost ~0 cycles. The narrowing is
+/// kept for clarity and because it is harmless. See PERF_NOTES.md.
 ///
 #[allow(clippy::too_many_arguments)]
 #[inline]
@@ -422,10 +428,11 @@ fn cut_gear_arr(
     } else if remaining < center {
         center = remaining;
     }
-    // Narrow once so every later index is bounded by `remaining`. `center` is
-    // already clamped to `remaining`, so `limit1 <= limit2 <= remaining / 2`
-    // and `2 * index + 1 < remaining` throughout — the compiler elides the
-    // per-byte source bounds check.
+    // Narrow once to the live window. Note: this does NOT remove the per-byte
+    // source bounds check (the compiler won't prove `2*index+1 < remaining`
+    // here); 4 such checks remain. They are free in practice — the loop is
+    // latency-bound on the hash chain, not throughput-bound. The real win is
+    // the `&[u64; 256]` GEAR tables above, which drop the table-lookup checks.
     let src = &source[..remaining];
     let limit1 = center / 2;
     let limit2 = remaining / 2;
