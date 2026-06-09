@@ -5,15 +5,19 @@
 FROM rust:1.95-bookworm
 WORKDIR /crate
 COPY . .
-# Compile both benches up front (bench profile: opt-level=3, thin LTO, 1 CGU).
+# Compile benches up front (bench profile: opt-level=3, thin LTO, 1 CGU).
+# On x86_64 the sha2 crate auto-uses SHA-NI at runtime, so the fuse bench here
+# shows hardware-accelerated SHA-256 (vs the portable fallback on the M1 laptop).
 RUN cargo bench --no-run --features internal-bench --bench ab \
- && cargo bench --no-run --bench chunking
+ && cargo bench --no-run --bench fuse \
+ && cargo bench --no-run --bench parallel
 CMD ["bash", "-c", "\
   export PATH=/usr/local/cargo/bin:$PATH; \
   echo '=== env ==='; uname -a; echo \"nproc=$(nproc)\"; \
-  echo; echo '=== A/B: old cut_gear vs patched (interleaved, one process) ==='; \
+  echo; echo '=== A/B: old cut_gear vs patched (interleaved) ==='; \
   cargo bench --features internal-bench --bench ab; \
-  echo; echo '=== descriptive throughput (criterion) ==='; \
-  cargo bench --bench chunking -- --warm-up-time 1 --measurement-time 3 --sample-size 40 2>&1 \
-    | grep -E 'time:|thrpt:|_paths/|content/|avg_size/|versions/|new_api/|small/'; \
+  echo; echo '=== FUSE: chunk+hash fused vs two-pass (SHA-NI auto on x86) ==='; \
+  cargo bench --bench fuse; \
+  echo; echo '=== PARALLEL: fidelity + thread scaling ==='; \
+  cargo bench --bench parallel; \
   echo; echo 'BENCH_DONE'; sleep infinity"]

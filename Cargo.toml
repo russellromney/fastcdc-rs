@@ -63,6 +63,12 @@ name = "fuse"
 path = "benches/fuse.rs"
 harness = false
 
+# Parallel chunking: cut-point fidelity of region-split chunking + thread scaling.
+[[bench]]
+name = "parallel"
+path = "benches/parallel.rs"
+harness = false
+
 # Interleaved old-vs-new A/B comparison. Requires the internal-bench feature:
 #   cargo bench --features internal-bench --bench ab
 [[bench]]

@@ -457,3 +457,169 @@ Findings:
 
 (Numbers are directional laptop figures; confirm on the Fly dedicated-CPU box,
 and re-check SHA-256 with the `asm` feature enabled.)
+
+---
+
+## 10. Experiment: parallel chunking (`benches/parallel.rs`)
+
+The single core is latency-bound (§6a). Data parallelism is the way past it. Two
+questions, both answered:
+
+**A. Fidelity — does region-split chunking match serial?** FastCDC resets its
+hash to 0 after every cut and restarts the search at `cut+min_size`, so two
+chunkers that ever cut at the same absolute offset are *identical forever after*.
+An independent chunker started at an arbitrary midpoint of a 64 MiB buffer:
+
+```
+resync distance past the split:  16,917 bytes  (= 1.0 average chunk)
+interior boundaries reproduced after resync:  1691/1691  (100.0000%)
+```
+
+So FastCDC is **self-synchronizing**: split it anywhere and the only chunks that
+differ from serial are the 1–2 straddling each seam. An N-way split has N−1
+seams → ~N−1 divergent chunks. For 64 MiB / 16 KiB (~4000 chunks), an 8-way
+split perturbs ~7 chunks = **0.17%** — a negligible dedup hit. Identical on M1
+and x86 (it's deterministic).
+
+> This refines a common warning (e.g. elemeng/chunkrs docs: "do not parallelize
+> within a single file — this destroys deduplication ratios"). With *controlled*
+> region splits that is too strong: the measured loss is the handful of seam
+> chunks, not the ratio wholesale. The warning holds for *uncontrolled* batching
+> where split points are arbitrary and unbounded.
+
+**B. Throughput scaling** (chunk a 64 MiB buffer split across N threads, min-of-15):
+
+```
+              M1 Pro (8 core)        Fly performance-2x (2 dedicated vCPU)
+ 1 thread     1879 MiB/s  1.00x      2275 MiB/s  1.00x
+ 2 threads    3772 MiB/s  2.01x      4147 MiB/s  1.82x
+ 4 threads    7494 MiB/s  3.99x      (only 2 cores)
+ 8 threads    8294 MiB/s  4.41x
+```
+
+Near-linear per available performance core (M1: perfect to 4, tapers at 8 over
+its 2 efficiency cores + memory bandwidth; Fly: 1.82x on its 2 cores). Combined
+with the per-core ~12%, this is the real path past the 2.2 GiB/s/core wall —
+and it matches cinch's shared-nothing, one-owner-per-tenant model.
+
+## 11. x86 confirmation (Fly dedicated CPU) — the dominance flips
+
+Re-running `fuse` on the Fly x86 box, where the `sha2` crate auto-uses **SHA-NI**:
+
+```
+                       M1 laptop (portable)     Fly x86 (SHA-NI / AVX2)
+ hash-only SHA-256          134 MiB/s                1514 MiB/s   (11.3x)
+ hash-only BLAKE3       ~770-1316 MiB/s              ~2700 MiB/s
+ chunk-only             ~960-1944 MiB/s              ~2000-2256 MiB/s
+ BLAKE3 fuse vs 2-pass       1.58x (16K)              1.07x
+```
+
+Two conclusions:
+1. **SHA-256 was an artifact, not a law.** Unaccelerated portable SHA on the M1
+   (no `asm` feature for aarch64) read as "hashing dominates." On any x86 server
+   (SHA-NI is in every Zen and recent Intel) it's ~1.5 GiB/s out of the box.
+2. **Which stage dominates depends on the hardware.** On x86 with hardware
+   hashing, BLAKE3 (~2.7) and SHA-256 (~1.5) are as fast as or faster than the
+   gear-hash scan (~2.0), so **the chunk loop becomes the bottleneck** — the
+   opposite of the laptop. That *raises* the value of the per-core chunk win and
+   parallel chunking on real servers, and shrinks the fuse win (faster caches +
+   hashing hide the re-read; 1.58x → 1.07x).
+
+The honest, hardware-aware summary: on a modern x86 server the chunk scan and the
+hash are within ~1.5x of each other, so a content-addressing pipeline wants *both*
+a fast (SIMD/parallel) chunker and hardware hashing — neither alone is enough.
+
+---
+
+## 12. Related work / algorithm landscape (and a premise check)
+
+This spike set out to *optimize FastCDC*. Surveying the field suggests the bigger
+question is *whether to use FastCDC at all*. Cinch has **no deployed chunks**
+(content-defined chunking is roadmap #14, not built), so there is **no
+cut-point-compatibility constraint** — we are free to pick the best algorithm,
+not bound to FastCDC's.
+
+| Project | Idea | Speed | Dedup | Notes for cinch |
+|---|---|---|---|---|
+| **fastcdc** (this crate) | gear hash, dual-mask NC | ~2 GiB/s/core (latency-bound) | baseline | what we patched; serial chain is the wall (§6a) |
+| **[orlp/mincdc](https://github.com/orlp/mincdc)** | **sliding-window minimum** cut points (SIMD, 4-byte window) | **41 GB/s** (9950X) vs FastCDC 6.6; 23.8 vs 4.1 on M2 | **61% vs 54%** on Linux kernel | **strong candidate.** Faster *and* better dedup *and* near-uniform chunk sizes (no long tail). Zlib license. |
+| **[srijs/rust-gearhash](https://github.com/srijs/rust-gearhash)** | gear hash + `next_match()`, SSE4.2/AVX2/NEON | multi-GiB/s | same family as FastCDC | the SIMD gear primitive; single-mask, different formulation → *different cut points*. Apache/MIT, `unsafe`+fuzzed. |
+| **[elemeng/chunkrs](https://github.com/elemeng/chunkrs)** | FastCDC, modern API, `#![forbid(unsafe)]`, `Bytes` zero-copy | ~3–5 GB/s target | FastCDC-equivalent | clean base if we stay on FastCDC; its roadmap (SIMD, HW hash) = our findings. |
+| **[QuickCDC](https://joshleeb.com/posts/quickcdc.html)** | feature-vector (front/end 3 bytes + len) skip table | very fast (skips hashing) | up to 2.2x in cases | **disqualified for cinch:** treats same-features+length as duplicate → can mis-dedup altered middles → **data loss**. CLAUDE.md: data loss is unacceptable. |
+| **[chonkie-inc/chunk](https://github.com/chonkie-inc/chunk)** | **semantic *text* chunking** (periods/newlines, SIMD) | ~1 TB/s | n/a | **different domain.** This is RAG/LLM text splitting, *not* dedup byte-CDC. Relevant to cinch's *agent/RAG* side, not storage dedup. Don't conflate the two "chunking"s. |
+
+**The key connection to §6a.** FastCDC's gear hash is a *serial dependency
+chain*, which is exactly why one core caps at ~2 GiB/s and SIMD can't easily help
+it. **mincdc sidesteps the whole problem**: a sliding-window *minimum* over a
+4-byte window is a vectorizable min-reduction, not a recurrence, so it hits
+40+ GB/s on one core. It doesn't *break* FastCDC's chain — it *avoids having
+one*. That, plus the better dedup ratio and the near-uniform chunk-size
+distribution (which is also nicer for cinch's per-GB tiering/billing and for
+bounded extents), makes mincdc the most interesting lead by a wide margin.
+
+**Revised recommendation.**
+1. **Evaluate mincdc head-to-head** against this patched FastCDC on cinch-shaped
+   data (agent files: overwrite/append, text+binary), measuring throughput,
+   dedup ratio, and chunk-size distribution. If it holds up, it likely beats
+   anything we could do to FastCDC.
+2. **Keep the patched FastCDC + `Chunker` as the safe default** in the meantime —
+   it's correct, tested, and shipped.
+3. **Reject QuickCDC** for any durability-critical path (data-loss risk).
+4. **Hardware hashing is mandatory regardless of chunker** (§9, §11): ensure
+   SHA-NI / BLAKE3-SIMD is on; it's an 11x lever and orthogonal to the chunker.
+5. **chonkie is a separate tool** for the (separate) text/RAG chunking need.
+
+This turns the "make FastCDC faster" task into a clearer strategic picture:
+the per-core FastCDC ceiling is ~2 GiB/s and latency-bound; mincdc reports ~20x
+that with better dedup; so the highest-value next step is a rigorous mincdc
+bake-off, not more FastCDC micro-optimization.
+
+## 13. The authoritative survey, and the methodology for choosing
+
+Gregoriadis, Balduf, Scheuermann & Pouwelse, *"A Thorough Investigation of
+Content-Defined Chunking Algorithms for Data Deduplication"* (submitted to IEEE
+TCC, Sept 2024, arXiv:2409.06066) is exactly the impartial comparison this
+decision needs. It re-implements and benchmarks the whole field on **four real
+datasets** across **four metrics** (throughput, dedup ratio, average chunk size,
+chunk-size variance), and explicitly calls out the bias in prior single-algorithm
+papers.
+
+Its taxonomy (which places everything above):
+- **BSW / rolling-hash + mask:** Rabin (1981), Buzhash (1997), **Gear (2014)**,
+  PCI (2020). **FastCDC = Gear + normalized chunking + cut-point skipping.** This
+  is the family we patched — and the one with the serial-hash latency wall.
+- **Local-extrema (no hash):** **AE (2015), RAM (2017), MII (2019)** — cut on a
+  local max/min over a window. The paper notes these "achieve higher throughput
+  than BSW algorithms" with "significantly lower chunk-size variance." **This is
+  the family mincdc belongs to** — and it's the throughput + low-variance winner.
+- **Statistical:** BFBC (2020) — byte-pair frequency table lookup.
+
+Concrete takeaways for cinch:
+- The paper independently corroborates our findings: it footnotes the
+  `gearhash` SIMD crate and notes Gear "is easy to SIMD-parallelize" with
+  data-parallelism (our §10), and it confirms extremum methods (mincdc's family)
+  are faster with lower variance.
+- It warns that prior throughput numbers are often **skewed by bundling the SHA
+  fingerprint into the measurement** (our §9/§11: hashing can dominate, and is
+  hardware-dependent) and by **artificial datasets** (zeros + random insertions)
+  that ignore low-entropy strings. Our own spike used synthetic SplitMix64 data —
+  same caveat applies; a real bake-off must use cinch-shaped data.
+- It derives corrected expected-chunk-size formulas for AE/RAM/MII/BFBC — useful
+  if we tune an extremum-based chunker to a target average for cinch's tiering.
+
+### Bottom line of the whole spike
+
+1. **Shipped, safe, done:** FastCDC patch (8→4 bounds checks, ~12% per core,
+   identical cut points) + zero-alloc `Chunker` API + a reproducible benchmark
+   suite (A/B, criterion, fuse, parallel) + neutral-env x86 validation.
+2. **Profiling verdict:** one FastCDC core is latency-bound at ~2 GiB/s; you get
+   past it with **data parallelism** (§10: near-linear, 100% fidelity) and
+   **hardware hashing** (§9/§11: 11x), *not* loop micro-opts (§6a).
+3. **Strategic lead:** the per-core ceiling is an artifact of the gear-hash
+   *recurrence*. **Extremum-based CDC (mincdc / AE / RAM / MII) avoids the
+   recurrence entirely** — mincdc reports ~20x throughput *and* better dedup *and*
+   lower size variance. Since cinch has no deployed chunks, it's free to choose.
+4. **Next step:** run the 2024-survey methodology — FastCDC vs mincdc (and
+   maybe RAM/MII) on real cinch data, scoring throughput + dedup ratio + chunk
+   size variance — before committing chunking for roadmap #14. Reject QuickCDC
+   (data-loss risk). Keep chonkie in mind only for the separate text/RAG need.
