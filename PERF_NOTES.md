@@ -623,3 +623,37 @@ Concrete takeaways for cinch:
    maybe RAM/MII) on real cinch data, scoring throughput + dedup ratio + chunk
    size variance — before committing chunking for roadmap #14. Reject QuickCDC
    (data-loss risk). Keep chonkie in mind only for the separate text/RAG need.
+
+## 14. The bake-off: FastCDC vs MinCDC (done)
+
+Built the §13 bake-off (`third_party/cdc-bakeoff` in cinch-cloud; depends on this
+fork + `mincdc`). Deterministic ~40 MiB corpus with realistic redundancy (10
+text bases × 6 edited versions — append/insert/overwrite — + 4 binary blobs),
+all algorithms tuned to **equal mean chunk size** (the only fair dedup test;
+FastCDC's quantized mean sets the reference). Metrics: throughput (chunk-only),
+dedup% (BLAKE3 fingerprints), and chunk-size distribution. M1 Pro / NEON:
+
+```
+mean ~10.3 KiB        MiB/s   dedup%    CV    p99
+FastCDC (patched)      1651   74.48%   0.52   29205   (baseline)
+MinCDC4               10155   74.87%   0.47   18924   (6.2x faster, tighter tail)
+MinCDCHash4            4992   74.56%   0.57   29392   (3.0x faster, robust default)
+fixed-size control        —   59.88%   0.09       —   (dedup collapses: boundary shift)
+```
+
+**Verdict: MinCDC matches FastCDC's dedup while running 3–6x faster** with
+equal-or-more-uniform sizes. The 16 KiB target gives the same shape. The speed
+ratio matches mincdc's published ~6x; on dedup it's a tie here (mincdc's README
+shows an *advantage* on real Linux-kernel data — data-dependent, but never
+worse). **Recommend MinCDCHash4** (the author's robust default — MinCDC4 can
+skew sizes on adversarial input; cinch's data-integrity bar wants the robust
+one, still 3x faster than FastCDC at equal dedup).
+
+Caveats: synthetic corpus + NEON. On x86/AVX2 mincdc's lead likely grows (its
+41 GB/s is on a 9950X). Confirm on a real cinch workload sample before locking
+the choice. Full method + numbers: `third_party/cdc-bakeoff/BAKEOFF.md`.
+
+**Bottom line of the whole effort:** the FastCDC patch is a fine, safe local win
+(~12%/core, identical cut points, shipped). But the strategically correct move
+for cinch is to **adopt MinCDCHash4 for roadmap #14** — 3x the throughput at the
+same dedup and similar uniformity — rather than invest further in FastCDC.
