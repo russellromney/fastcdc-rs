@@ -21,11 +21,15 @@ futures = ["dep:futures"]
 # interleaved A/B benchmark can time old vs new in a single process. Not part
 # of the public API.
 internal-bench = []
+# Experimental: pure-scalar parallel-strip chunking for large average sizes on
+# aarch64 (ILP win on wide ARM cores). Byte-identical output. Off by default.
+strip-experimental = []
 
 [dev-dependencies]
 aes = "0.9.0"
 blake3 = "1.8.4"
 criterion = "0.5"
+gearhash = "0.1"
 sha2 = "0.10"
 byteorder = "1.4.3"
 clap = { version = "4.2.1", features = ["cargo"] }
@@ -82,3 +86,8 @@ required-features = ["internal-bench"]
 opt-level = 3
 lto = "thin"
 codegen-units = 1
+
+[[bench]]
+name = "strip"
+path = "benches/strip.rs"
+harness = false

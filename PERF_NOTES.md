@@ -108,6 +108,95 @@ the margin, the interleaved on-hardware A/B wins.
 
 ---
 
+# Appendix: SIMD / parallel-chunking investigation (issue #42)
+
+Issue [#42](https://github.com/nlfiedler/fastcdc-rs/issues/42) asks for a SIMD
+gear hash. We evaluated every credible option on real hardware — an **Apple M1
+Pro (ARM/NEON)** and a **dedicated AMD EPYC core (x86/AVX2)** on Fly.io — with
+the interleaved-A/B harness (min-of-41, alternating order). **Every variant
+below produces byte-identical cut points; only speed differs.** Numbers are
+MiB/s for the `v2020` cut path on random data; ratios are vs the scalar 2-byte
+roll baseline.
+
+## What we measured
+
+**1. The `gearhash` crate** (the crate named in #42; srijs). Fed *fastcdc's*
+GEAR table it reproduces our cut points exactly. Its AVX2 path keeps the hash
+state in vector lanes (genuine 4-wide parallelism).
+
+| | M1 (no NEON path → scalar fallback) | EPYC AVX2 |
+|---|---|---|
+| gearhash vs roll | **0.78× (−22%)** | **1.2–1.6× (+20–60%)** |
+
+Real win on x86; regression on ARM. x86-only, and adds an `unsafe` dependency to
+a pure-Rust crate.
+
+**2. `johnrichardrinehart`'s SIMD commit** (bc8813a, the actual PR-in-progress
+for #42; AVX2/SSE4.1/NEON). Correct, but a regression on **both** arches:
+
+| | M1 NEON | EPYC AVX2 |
+|---|---|---|
+| vs roll | **0.91× (−9%)** | **0.62× (−38%)** |
+
+Root cause: it computes the hashes in *scalar* registers and only moves them
+into vectors for the mask compare — keeping the sequential dependency *and*
+paying GPR↔vector domain-crossing. It vectorizes the part that was already free
+(the roll is latency-bound on the recurrence; the mask check hides in its
+shadow). **Do not merge as-is.**
+
+**3. Pure-scalar parallel-strip ILP (no SIMD, no `unsafe`).** Break the
+recurrence's dependency chain by running N independent strip-hashes interleaved,
+so a wide OOO core overlaps them. A tight branchless detector finds the block
+with a cut; the exact point/hash is then located with the real 2-byte roll
+(hence byte-identical). Size-dependent:
+
+| avg size | M1 strip8/roll | EPYC strip8/roll |
+|---|---|---|
+| 16 KiB | 0.76× | 0.64× |
+| 64 KiB | 1.01× | — |
+| 128 KiB | **1.10×** | — |
+| 1–2 MiB | **1.19–1.20×** | 0.77–0.82× |
+
+**Wins on M1 for large chunks (up to +20%); loses on x86.** The warm-up +
+locate overhead dominates for small chunks (block ≈ chunk). Crossover ~64 KiB on
+M1. Wide ARM integer cores extract the ILP; Zen3 does not.
+
+**4. Our own wider AVX2 (8-wide, two `__m256i`).** Tried to beat gearhash's
+4-wide on x86. It does not: `avx8 < avx4 < gearhash` (e.g. at 2 MiB, 0.84× of
+gearhash). The vector ALU saturates at 4 lanes for this op mix, and a
+detector+rescan structure can't beat gearhash's locate-in-lane. **4-wide AVX2 is
+the practical x86 ceiling; don't widen.**
+
+## Conclusion — the two architectures want opposite techniques
+
+| | small chunks (≤64 KiB) | large chunks (≥128 KiB) |
+|---|---|---|
+| **x86 / AVX2** | gearhash 4-wide | gearhash 4-wide (ceiling) |
+| **ARM / wide OOO** | scalar roll | **scalar ILP striping** |
+| **either** | scalar roll | — |
+
+No single technique is universally best. gearhash loses on ARM; striping loses
+on x86; both lose to the plain roll at 16 KiB.
+
+## What shipped here (experimental, off by default)
+
+`cut_strip` — pure-scalar parallel-strip chunking (`STRIP_N = 8`,
+`STRIP_STRIDE = 1024`), byte-identical to `cut_gear_arr` (proven by the
+`strip_matches_scalar` test: hash + cut point, fixture + synthetic, all sizes).
+Wired into `cut_gear` behind `#[cfg(all(target_arch = "aarch64", feature =
+"strip-experimental"))]` and only for `avg_size >= STRIP_THRESHOLD` (128 KiB).
+Default builds are unchanged and bit-for-bit identical; the full suite passes
+with the feature both on and off.
+
+This is recorded for evaluation, not yet proposed upstream. An eventual #42 PR
+would likely: keep the scalar roll as the cross-platform default; offer an
+opt-in `simd` feature dispatching to vendored gearhash-style 4-wide AVX2 on x86
+and this scalar striping on aarch64 for large averages; never change the
+default. Benches: `benches/strip.rs` (roll / gearhash / strip / AVX2),
+`benches/ab.rs` (adds a gearhash column).
+
+---
+
 *These notes came out of a downstream performance spike; happy to share the
 benchmark harness (the interleaved A/B + the `llvm-mca` loop) if useful.
 Developed with Claude Code.*

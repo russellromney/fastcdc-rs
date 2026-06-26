@@ -323,6 +323,18 @@ pub fn cut_gear(
     let gear_ls: &[u64; 256] = gear_ls
         .try_into()
         .expect("GEAR_LS table must have 256 entries");
+    // On wide ARM cores, large average sizes benefit from parallel-strip
+    // chunking (pure scalar ILP); byte-identical output. Off by default; below
+    // the threshold and on other arches the scalar roll wins. See PERF_NOTES.md.
+    #[cfg(all(target_arch = "aarch64", feature = "strip-experimental"))]
+    {
+        if avg_size >= STRIP_THRESHOLD {
+            return cut_strip(
+                source, min_size, avg_size, max_size, mask_s, mask_l, mask_s_ls, mask_l_ls, gear,
+                gear_ls,
+            );
+        }
+    }
     cut_gear_arr(
         source, min_size, avg_size, max_size, mask_s, mask_l, mask_s_ls, mask_l_ls, gear, gear_ls,
     )
@@ -465,6 +477,176 @@ fn cut_gear_arr(
     // If all else fails, return the largest chunk. This will happen with
     // pathological data, such as all zeroes.
     (hash, remaining)
+}
+
+// ===========================================================================
+// Experimental: parallel-strip cut for large average chunk sizes (ARM).
+//
+// `cut_gear_arr` is latency-bound on the gear-hash recurrence. On a wide
+// out-of-order ARM core (Apple Silicon, Graviton) we can hide that latency by
+// running several INDEPENDENT strip-hashes interleaved (instruction-level
+// parallelism) — pure scalar, no SIMD, no `unsafe`. The gear hash is a 64-bit
+// rolling value, so a strip starting at offset `s` reproduces the reference
+// hash for positions >= s once it has 64 bytes of history; we warm each strip
+// up from `s - 64` (seed 0), matching what the serial scan would hold there.
+//
+// The strip loop is only a fast *detector* ("is there a cut in this block?").
+// The exact cut point and hash are then located with the real 2-byte roll over
+// the one block that fired, so the result is byte-identical to `cut_gear_arr`
+// (cut point AND hash) — see the `strip_matches_scalar` test.
+//
+// Wins only for large average sizes (the warm-up + locate overhead dominates
+// for small chunks); see `STRIP_THRESHOLD` and PERF_NOTES.md.
+// ===========================================================================
+
+/// Number of independent strips run interleaved. 8 gave the best ILP on M1.
+#[allow(dead_code)]
+const STRIP_N: usize = 8;
+/// Bytes per strip per block. Large enough that the 64-byte warm-up amortizes.
+#[allow(dead_code)]
+const STRIP_STRIDE: usize = 1024;
+/// Only stripe when the average chunk size is at least this large; below it the
+/// scalar 2-byte roll wins. Crossover measured at ~64 KiB on M1; 128 KiB leaves
+/// margin.
+pub const STRIP_THRESHOLD: usize = 128 * 1024;
+
+/// Single-byte gear warm-up to `start`, seeded 0 from `max(min, start - 64)`.
+#[inline(always)]
+#[allow(dead_code)]
+fn strip_warmup(src: &[u8], start: usize, min: usize, gear: &[u64; 256]) -> u64 {
+    let w = if start >= min + 64 { start - 64 } else { min };
+    let mut h = 0u64;
+    let mut i = w;
+    while i < start {
+        h = (h << 1).wrapping_add(gear[src[i] as usize]);
+        i += 1;
+    }
+    h
+}
+
+/// Exact 2-byte-roll locate over `[bs, be)`, warmed up so the returned hash and
+/// position are identical to what `cut_gear_arr` would produce. Returns the
+/// running hash and `Some(pos)` at the first cut, or `(final_hash, None)`.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+#[allow(dead_code)]
+fn strip_locate(
+    src: &[u8],
+    bs: usize,
+    be: usize,
+    min: usize,
+    center: usize,
+    mask_s: u64,
+    mask_l: u64,
+    mask_s_ls: u64,
+    mask_l_ls: u64,
+    gear: &[u64; 256],
+    gear_ls: &[u64; 256],
+) -> (u64, Option<usize>) {
+    // warm up the 2-byte roll register to `bs` (both even; 64 bytes = 32 pairs
+    // washes the seed out exactly).
+    let ws = if bs >= min + 64 { bs - 64 } else { min };
+    let mut hash = 0u64;
+    let mut i = ws;
+    while i < bs {
+        hash = (hash << 2)
+            .wrapping_add(gear_ls[src[i] as usize])
+            .wrapping_add(gear[src[i + 1] as usize]);
+        i += 2;
+    }
+    let mut a = bs;
+    while a + 1 < be {
+        let (m_ls, m) = if a < center { (mask_s_ls, mask_s) } else { (mask_l_ls, mask_l) };
+        hash = (hash << 2).wrapping_add(gear_ls[src[a] as usize]);
+        if (hash & m_ls) == 0 {
+            return (hash, Some(a));
+        }
+        hash = hash.wrapping_add(gear[src[a + 1] as usize]);
+        if (hash & m) == 0 {
+            return (hash, Some(a + 1));
+        }
+        a += 2;
+    }
+    (hash, None)
+}
+
+/// Parallel-strip cut. Byte-identical cut points and hashes to `cut_gear_arr`.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::needless_range_loop)] // k indexes both the strip and its byte offset
+#[allow(dead_code)]
+fn cut_strip(
+    source: &[u8],
+    min_size: usize,
+    avg_size: usize,
+    max_size: usize,
+    mask_s: u64,
+    mask_l: u64,
+    mask_s_ls: u64,
+    mask_l_ls: u64,
+    gear: &[u64; 256],
+    gear_ls: &[u64; 256],
+) -> (u64, usize) {
+    let mut remaining = source.len();
+    if remaining <= min_size {
+        return (0, remaining);
+    }
+    let mut center = avg_size;
+    if remaining > max_size {
+        remaining = max_size;
+    } else if remaining < center {
+        center = remaining;
+    }
+    let src = &source[..remaining];
+
+    let mut base = min_size;
+    while base + STRIP_N * STRIP_STRIDE <= remaining {
+        let block_end = base + STRIP_N * STRIP_STRIDE;
+        // Blocks straddling the mask switch are rare (once per chunk): locate
+        // them directly so the detector can use one uniform mask.
+        if base < center && block_end > center {
+            let (h, m) = strip_locate(
+                src, base, block_end, min_size, center, mask_s, mask_l, mask_s_ls, mask_l_ls, gear,
+                gear_ls,
+            );
+            if let Some(p) = m {
+                return (h, p);
+            }
+            base = block_end;
+            continue;
+        }
+        let mask = if base >= center { mask_l } else { mask_s };
+        // warm up the N strips
+        let mut h = [0u64; STRIP_N];
+        for k in 0..STRIP_N {
+            h[k] = strip_warmup(src, base + k * STRIP_STRIDE, min_size, gear);
+        }
+        // tight branchless detector: N independent recurrences, OR the hits
+        let mut any = false;
+        for t in 0..STRIP_STRIDE {
+            for k in 0..STRIP_N {
+                h[k] = (h[k] << 1).wrapping_add(gear[src[base + k * STRIP_STRIDE + t] as usize]);
+                any |= (h[k] & mask) == 0;
+            }
+        }
+        if any {
+            let (hh, m) = strip_locate(
+                src, base, block_end, min_size, center, mask_s, mask_l, mask_s_ls, mask_l_ls, gear,
+                gear_ls,
+            );
+            if let Some(p) = m {
+                return (hh, p);
+            }
+        }
+        base += STRIP_N * STRIP_STRIDE;
+    }
+    // scalar tail
+    let (hh, m) = strip_locate(
+        src, base, remaining, min_size, center, mask_s, mask_l, mask_s_ls, mask_l_ls, gear, gear_ls,
+    );
+    match m {
+        Some(p) => (hh, p),
+        None => (hh, remaining),
+    }
 }
 
 // Rounded base-2 logarithm; matches the behavior pre-4.0.0 so that mask
@@ -1086,6 +1268,58 @@ impl<R: Read> Iterator for StreamCDC<R> {
 mod tests {
     use super::*;
     use std::fs::{self, File};
+
+    // The parallel-strip cut must be byte-identical to the scalar roll — same
+    // cut points AND same hashes — at every average size, or it is not a safe
+    // drop-in. Checks synthetic data and the real fixture across sizes that
+    // exercise both the small (tail-only) and large (striped) paths.
+    #[test]
+    fn strip_matches_scalar() {
+        let (gear, gear_ls) = get_gear_with_seed(0);
+        let gear: &[u64; 256] = (&*gear).try_into().unwrap();
+        let gear_ls: &[u64; 256] = (&*gear_ls).try_into().unwrap();
+
+        // 8 MiB synthetic buffer (LCG; deterministic).
+        let mut buf = vec![0u8; 8 * 1024 * 1024];
+        let mut x = 0x1234_5678_9abc_def0u64;
+        for b in buf.iter_mut() {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *b = (x >> 33) as u8;
+        }
+        let fixture = fs::read("test/fixtures/SekienAkashita.jpg").ok();
+
+        let run = |data: &[u8], avg: usize, strip: bool| -> Vec<(u64, usize)> {
+            let bits = logarithm2(avg) as usize;
+            let mask_s = MASKS[bits + 1];
+            let mask_l = MASKS[bits - 1];
+            let (msl, mll) = (mask_s << 1, mask_l << 1);
+            let (min, max) = (avg / 4, avg * 4);
+            let mut out = Vec::new();
+            let mut pos = 0usize;
+            while pos < data.len() {
+                let (h, c) = if strip {
+                    cut_strip(&data[pos..], min, avg, max, mask_s, mask_l, msl, mll, gear, gear_ls)
+                } else {
+                    cut_gear_arr(&data[pos..], min, avg, max, mask_s, mask_l, msl, mll, gear, gear_ls)
+                };
+                if c == 0 {
+                    break;
+                }
+                out.push((h, c));
+                pos += c;
+            }
+            out
+        };
+
+        for &avg in &[256usize, 1024, 16384, 65536, 131072, 1_048_576] {
+            assert_eq!(run(&buf, avg, false), run(&buf, avg, true), "synthetic avg={avg}");
+            if let Some(f) = &fixture {
+                assert_eq!(run(f, avg, false), run(f, avg, true), "fixture avg={avg}");
+            }
+        }
+    }
 
     #[test]
     #[should_panic]
