@@ -24,6 +24,9 @@ internal-bench = []
 # Experimental: pure-scalar parallel-strip chunking for large average sizes on
 # aarch64 (ILP win on wide ARM cores). Byte-identical output. Off by default.
 strip-experimental = []
+# Experimental: SIMD gear-hash boundary scan on x86_64 (vendored gearhash AVX2).
+# Byte-identical output. Off by default.
+simd = []
 
 [dev-dependencies]
 aes = "0.9.0"

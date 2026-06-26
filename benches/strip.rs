@@ -415,8 +415,13 @@ fn main() {
     // closures capturing the tables, all with signature (&[u8], Cfg)->(u64,usize)
     let roll = |s: &[u8], c: Cfg| cut_roll(s, c, g, gl);
     let gh = |s: &[u8], c: Cfg| cut_gearhash(s, c, g);
-    let s4 = |s: &[u8], c: Cfg| cut_strip_avx::<4>(s, c, g);
-    let s8 = |s: &[u8], c: Cfg| cut_strip_avx::<8>(s, c, g);
+    let s4 = |s: &[u8], c: Cfg| cut_strip::<8>(s, c, g); // scalar strip (ARM path)
+    // our vendored gearhash AVX2 in the actual crate (x86 path)
+    let s8 = |s: &[u8], c: Cfg| {
+        fastcdc::v2020::cut_simd(
+            s, c.min, c.avg, c.max, c.mask_s, c.mask_l, c.mask_s_ls, c.mask_l_ls, g, gl,
+        )
+    };
 
     const ROUNDS: usize = 41;
     const WARMUP: usize = 5;
@@ -431,10 +436,10 @@ fn main() {
         ("random 32MiB avg2MiB".into(), gen_random(32 * mib, 4), 2 * mib),
     ];
 
-    println!("STRIDE={STRIDE} (strip4/strip8 = AVX2 in-lane on x86, scalar fallback on ARM)");
+    println!("STRIDE={STRIDE}  (scalar = ARM strip8; vsimd = vendored gearhash AVX2 in crate)");
     println!(
-        "{:<22} {:>7} {:>7} {:>7} {:>7} | {:>6} {:>6} {:>6} {:>7}",
-        "case", "roll", "gear", "avx4", "avx8", "g/roll", "a8/roll", "a8/g", ""
+        "{:<22} {:>7} {:>7} {:>7} {:>7} | {:>6} {:>7} {:>7}",
+        "case", "roll", "gear", "scalar", "vsimd", "g/roll", "vs/roll", "vs/gear"
     );
     println!("{}", "-".repeat(92));
 
@@ -471,7 +476,7 @@ fn main() {
         let mn = |i: usize| t.iter().map(|r| r[i]).min().unwrap();
         let (roll_m, gh_m, s4_m, s8_m) = (mn(0), mn(1), mn(2), mn(3));
         println!(
-            "{:<22} {:>7.0} {:>7.0} {:>7.0} {:>7.0} | {:>5.2}x {:>5.2}x {:>5.2}x",
+            "{:<22} {:>7.0} {:>7.0} {:>7.0} {:>7.0} | {:>5.2}x {:>6.2}x {:>6.2}x",
             label,
             mib_s(data.len(), roll_m),
             mib_s(data.len(), gh_m),
@@ -483,5 +488,5 @@ fn main() {
         );
     }
     println!();
-    println!("MiB/s = min-of-{ROUNDS}. g/roll,a8/roll >1 => faster than roll. a8/g >1 => avx8 BEATS gearhash.");
+    println!("MiB/s = min-of-{ROUNDS}. vs/roll >1 => vendored AVX2 faster than roll. vs/gear ~1 => matches the crate.");
 }

@@ -51,6 +51,11 @@ mod async_stream_cdc;
 #[cfg(any(feature = "tokio", feature = "futures"))]
 pub use async_stream_cdc::*;
 
+// Vendored SIMD gear-hash boundary scan (from the gearhash crate). Used by the
+// x86 `simd` feature path; carries a portable scalar fallback so it compiles on
+// every architecture (the equivalence test exercises it on all of them).
+mod gear_simd;
+
 /// Smallest acceptable value for the minimum chunk size.
 pub const MINIMUM_MIN: usize = 64;
 /// Largest acceptable value for the minimum chunk size.
@@ -335,6 +340,15 @@ pub fn cut_gear(
             );
         }
     }
+    // x86: vendored gearhash AVX2 boundary scan. Byte-identical; opt-in.
+    #[cfg(all(target_arch = "x86_64", feature = "simd"))]
+    {
+        return cut_simd(
+            source, min_size, avg_size, max_size, mask_s, mask_l, mask_s_ls, mask_l_ls, gear,
+            gear_ls,
+        );
+    }
+    #[allow(unreachable_code)]
     cut_gear_arr(
         source, min_size, avg_size, max_size, mask_s, mask_l, mask_s_ls, mask_l_ls, gear, gear_ls,
     )
@@ -652,6 +666,68 @@ fn cut_strip(
         Some(p) => (hh, p),
         None => (hh, remaining),
     }
+}
+
+// ===========================================================================
+// Experimental: SIMD gear-hash cut for x86 (vendored gearhash AVX2).
+//
+// `gear_simd::next_match` runs the boundary scan in AVX2 lanes (or scalar where
+// AVX2 is unavailable). It uses fastcdc's own GEAR table, so cut points are
+// identical. Normalized chunking switches the mask at `center`, so we call it
+// twice (mask_s region, then mask_l region) with the hash state carried across.
+//
+// Hash transparency: gear_simd leaves `*hash` equal to the true single-byte
+// gear hash at the match, whereas `cut_gear_arr` returns 2*hash at even cut
+// positions and hash at odd ones (an artifact of the two-byte roll; proven by
+// the register invariant in cut_gear_arr). So we recover the exact returned
+// hash with a single parity-based shift — no re-roll. The rare no-cut case
+// defers to the scalar roll for its exact final hash.
+// ===========================================================================
+#[allow(clippy::too_many_arguments)]
+#[doc(hidden)]
+pub fn cut_simd(
+    source: &[u8],
+    min_size: usize,
+    avg_size: usize,
+    max_size: usize,
+    mask_s: u64,
+    mask_l: u64,
+    mask_s_ls: u64,
+    mask_l_ls: u64,
+    gear: &[u64; 256],
+    gear_ls: &[u64; 256],
+) -> (u64, usize) {
+    let mut remaining = source.len();
+    if remaining <= min_size {
+        return (0, remaining);
+    }
+    let mut center = avg_size;
+    if remaining > max_size {
+        remaining = max_size;
+    } else if remaining < center {
+        center = remaining;
+    }
+    let src = &source[..remaining];
+    let mut hash = 0u64;
+    // even cut position => cut_gear_arr returns 2*hash; odd => hash. min is even
+    // for power-of-two averages, so absolute parity selects the convention.
+    let convert = |p: usize, h: u64| -> u64 { if p & 1 == 0 { h << 1 } else { h } };
+
+    // Region 1: [min, center) under mask_s. (Empty slices return None.)
+    if let Some(n) = gear_simd::next_match(&mut hash, gear, &src[min_size..center], mask_s) {
+        let p = min_size + n - 1;
+        return (convert(p, hash), p);
+    }
+    // Region 2: [center, remaining) under mask_l, hash state continues.
+    if let Some(n) = gear_simd::next_match(&mut hash, gear, &src[center..remaining], mask_l) {
+        let p = center + n - 1;
+        return (convert(p, hash), p);
+    }
+    // No cut in [min, max): defer to the scalar roll for the exact final hash
+    // (rare; pathological data such as all zeros).
+    cut_gear_arr(
+        source, min_size, avg_size, max_size, mask_s, mask_l, mask_s_ls, mask_l_ls, gear, gear_ls,
+    )
 }
 
 // Rounded base-2 logarithm; matches the behavior pre-4.0.0 so that mask
@@ -1295,7 +1371,13 @@ mod tests {
         }
         let fixture = fs::read("test/fixtures/SekienAkashita.jpg").ok();
 
-        let run = |data: &[u8], avg: usize, strip: bool| -> Vec<(u64, usize)> {
+        #[derive(Clone, Copy)]
+        enum Impl {
+            Roll,
+            Strip,
+            Simd,
+        }
+        let run = |data: &[u8], avg: usize, imp: Impl| -> Vec<(u64, usize)> {
             let bits = logarithm2(avg) as usize;
             let mask_s = MASKS[bits + 1];
             let mask_l = MASKS[bits - 1];
@@ -1304,10 +1386,11 @@ mod tests {
             let mut out = Vec::new();
             let mut pos = 0usize;
             while pos < data.len() {
-                let (h, c) = if strip {
-                    cut_strip(&data[pos..], min, avg, max, mask_s, mask_l, msl, mll, gear, gear_ls)
-                } else {
-                    cut_gear_arr(&data[pos..], min, avg, max, mask_s, mask_l, msl, mll, gear, gear_ls)
+                let s = &data[pos..];
+                let (h, c) = match imp {
+                    Impl::Roll => cut_gear_arr(s, min, avg, max, mask_s, mask_l, msl, mll, gear, gear_ls),
+                    Impl::Strip => cut_strip(s, min, avg, max, mask_s, mask_l, msl, mll, gear, gear_ls),
+                    Impl::Simd => cut_simd(s, min, avg, max, mask_s, mask_l, msl, mll, gear, gear_ls),
                 };
                 if c == 0 {
                     break;
@@ -1319,9 +1402,13 @@ mod tests {
         };
 
         for &avg in &[256usize, 1024, 16384, 65536, 131072, 1_048_576] {
-            assert_eq!(run(&buf, avg, false), run(&buf, avg, true), "synthetic avg={avg}");
+            let reference = run(&buf, avg, Impl::Roll);
+            assert_eq!(reference, run(&buf, avg, Impl::Strip), "synthetic strip avg={avg}");
+            assert_eq!(reference, run(&buf, avg, Impl::Simd), "synthetic simd avg={avg}");
             if let Some(f) = &fixture {
-                assert_eq!(run(f, avg, false), run(f, avg, true), "fixture avg={avg}");
+                let r = run(f, avg, Impl::Roll);
+                assert_eq!(r, run(f, avg, Impl::Strip), "fixture strip avg={avg}");
+                assert_eq!(r, run(f, avg, Impl::Simd), "fixture simd avg={avg}");
             }
         }
     }
