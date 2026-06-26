@@ -506,9 +506,9 @@ const STRIP_N: usize = 8;
 #[allow(dead_code)]
 const STRIP_STRIDE: usize = 1024;
 /// Only stripe when the average chunk size is at least this large; below it the
-/// scalar 2-byte roll wins. Crossover measured at ~64 KiB on M1; 128 KiB leaves
-/// margin.
-pub const STRIP_THRESHOLD: usize = 128 * 1024;
+/// scalar 2-byte roll wins. With the locate-winning-strip detector the crossover
+/// is ~32 KiB on M1; 64 KiB leaves margin (measured ~1.09x there).
+pub const STRIP_THRESHOLD: usize = 64 * 1024;
 
 /// Single-byte gear warm-up to `start`, seeded 0 from `max(min, start - 64)`.
 #[inline(always)]
@@ -620,18 +620,23 @@ fn cut_strip(
         for k in 0..STRIP_N {
             h[k] = strip_warmup(src, base + k * STRIP_STRIDE, min_size, gear);
         }
-        // tight branchless detector: N independent recurrences, OR the hits
-        let mut any = false;
+        // branchless detector: bit k records whether strip k contains a cut.
+        // The strips tile the block in order, so the earliest cut is in the
+        // lowest matching strip — we then locate ONLY that strip (1/N of the
+        // block) rather than rescanning the whole block.
+        let mut matched = 0u32;
         for t in 0..STRIP_STRIDE {
             for k in 0..STRIP_N {
                 h[k] = (h[k] << 1).wrapping_add(gear[src[base + k * STRIP_STRIDE + t] as usize]);
-                any |= (h[k] & mask) == 0;
+                matched |= ((h[k] & mask == 0) as u32) << k;
             }
         }
-        if any {
+        if matched != 0 {
+            let k = matched.trailing_zeros() as usize;
+            let ks = base + k * STRIP_STRIDE;
             let (hh, m) = strip_locate(
-                src, base, block_end, min_size, center, mask_s, mask_l, mask_s_ls, mask_l_ls, gear,
-                gear_ls,
+                src, ks, ks + STRIP_STRIDE, min_size, center, mask_s, mask_l, mask_s_ls, mask_l_ls,
+                gear, gear_ls,
             );
             if let Some(p) = m {
                 return (hh, p);

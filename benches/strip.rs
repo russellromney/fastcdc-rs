@@ -189,20 +189,20 @@ fn cut_strip<const N: usize>(source: &[u8], c: Cfg, gear: &[u64; 256]) -> (u64, 
         for k in 0..N {
             h[k] = warmup(src, base + k * STRIDE, c.min, gear);
         }
-        // TIGHT branchless detector: advance N independent hashes per step, OR
-        // the mask hits into a single accumulator. No per-byte branch, no
-        // per-strip state -> the N recurrences run as N parallel dep chains.
-        let mut any = 0u64;
+        // branchless detector: bit k = strip k contains a cut. Locate only the
+        // lowest matching strip (1/N of the block), not the whole block.
+        let mut matched = 0u32;
         for t in 0..STRIDE {
             for k in 0..N {
                 h[k] = (h[k] << 1).wrapping_add(gear[src[base + k * STRIDE + t] as usize]);
-                any |= (((h[k] & mask) == 0) as u64) << k;
+                matched |= (((h[k] & mask) == 0) as u32) << k;
             }
         }
-        if any != 0 {
-            // a cut exists in this block; locate it exactly with one serial pass
-            let warm = warmup(src, base, c.min, gear);
-            if let Some((cut, hh)) = scan_scalar(src, base, block_end, warm, center, &c, gear) {
+        if matched != 0 {
+            let k = matched.trailing_zeros() as usize;
+            let ks = base + k * STRIDE;
+            let warm = warmup(src, ks, c.min, gear);
+            if let Some((cut, hh)) = scan_scalar(src, ks, ks + STRIDE, warm, center, &c, gear) {
                 return (hh, cut);
             }
         }
@@ -225,6 +225,7 @@ fn cut_strip<const N: usize>(source: &[u8], c: Cfg, gear: &[u64; 256]) -> (u64, 
 // the scalar strip (gated). On non-x86 / no-AVX2 it falls back to the scalar
 // detector, so the bench still builds and runs on ARM.
 
+/// Returns a bitmask: bit k set if strip k contains a cut in this block.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn detect_avx2(
@@ -234,7 +235,7 @@ unsafe fn detect_avx2(
     mask: u64,
     gear: &[u64; 256],
     h: &[u64],
-) -> bool {
+) -> u32 {
     use std::arch::x86_64::*;
     let maskv = _mm256_set1_epi64x(mask as i64);
     let zero = _mm256_setzero_si256();
@@ -243,30 +244,34 @@ unsafe fn detect_avx2(
     if h.len() == 8 {
         let mut h0 = _mm256_setr_epi64x(h[0] as i64, h[1] as i64, h[2] as i64, h[3] as i64);
         let mut h1 = _mm256_setr_epi64x(h[4] as i64, h[5] as i64, h[6] as i64, h[7] as i64);
-        let mut acc = zero;
+        let mut a0 = zero;
+        let mut a1 = zero;
         for t in 0..stride {
             let gv0 = _mm256_setr_epi64x(g(0, t), g(1, t), g(2, t), g(3, t));
             let gv1 = _mm256_setr_epi64x(g(4, t), g(5, t), g(6, t), g(7, t));
             h0 = _mm256_add_epi64(_mm256_slli_epi64(h0, 1), gv0);
             h1 = _mm256_add_epi64(_mm256_slli_epi64(h1, 1), gv1);
-            let c0 = _mm256_cmpeq_epi64(_mm256_and_si256(h0, maskv), zero);
-            let c1 = _mm256_cmpeq_epi64(_mm256_and_si256(h1, maskv), zero);
-            acc = _mm256_or_si256(acc, _mm256_or_si256(c0, c1));
+            // per-lane "ever matched": OR the cmpeq results across t
+            a0 = _mm256_or_si256(a0, _mm256_cmpeq_epi64(_mm256_and_si256(h0, maskv), zero));
+            a1 = _mm256_or_si256(a1, _mm256_cmpeq_epi64(_mm256_and_si256(h1, maskv), zero));
         }
-        _mm256_movemask_epi8(acc) != 0
+        // movemask_pd: 1 bit per 64-bit lane (its sign bit; all-ones if matched)
+        let m0 = _mm256_movemask_pd(_mm256_castsi256_pd(a0)) as u32;
+        let m1 = _mm256_movemask_pd(_mm256_castsi256_pd(a1)) as u32;
+        m0 | (m1 << 4)
     } else {
         let mut h0 = _mm256_setr_epi64x(h[0] as i64, h[1] as i64, h[2] as i64, h[3] as i64);
-        let mut acc = zero;
+        let mut a0 = zero;
         for t in 0..stride {
             let gv0 = _mm256_setr_epi64x(g(0, t), g(1, t), g(2, t), g(3, t));
             h0 = _mm256_add_epi64(_mm256_slli_epi64(h0, 1), gv0);
-            let c0 = _mm256_cmpeq_epi64(_mm256_and_si256(h0, maskv), zero);
-            acc = _mm256_or_si256(acc, c0);
+            a0 = _mm256_or_si256(a0, _mm256_cmpeq_epi64(_mm256_and_si256(h0, maskv), zero));
         }
-        _mm256_movemask_epi8(acc) != 0
+        _mm256_movemask_pd(_mm256_castsi256_pd(a0)) as u32
     }
 }
 
+/// Bitmask: bit k set if strip k contains a cut in this block.
 #[inline]
 fn block_detect<const N: usize>(
     src: &[u8],
@@ -274,7 +279,7 @@ fn block_detect<const N: usize>(
     mask: u64,
     gear: &[u64; 256],
     h: &[u64; N],
-) -> bool {
+) -> u32 {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") {
@@ -283,14 +288,14 @@ fn block_detect<const N: usize>(
     }
     // scalar fallback detector
     let mut hh = *h;
-    let mut any = false;
+    let mut matched = 0u32;
     for t in 0..STRIDE {
         for k in 0..N {
             hh[k] = (hh[k] << 1).wrapping_add(gear[src[base + k * STRIDE + t] as usize]);
-            any |= (hh[k] & mask) == 0;
+            matched |= ((hh[k] & mask == 0) as u32) << k;
         }
     }
-    any
+    matched
 }
 
 fn cut_strip_avx<const N: usize>(source: &[u8], c: Cfg, gear: &[u64; 256]) -> (u64, usize) {
@@ -321,9 +326,12 @@ fn cut_strip_avx<const N: usize>(source: &[u8], c: Cfg, gear: &[u64; 256]) -> (u
         for k in 0..N {
             h[k] = warmup(src, base + k * STRIDE, c.min, gear);
         }
-        if block_detect::<N>(src, base, mask, gear, &h) {
-            let warm = warmup(src, base, c.min, gear);
-            if let Some((cut, hh)) = scan_scalar(src, base, block_end, warm, center, &c, gear) {
+        let matched = block_detect::<N>(src, base, mask, gear, &h);
+        if matched != 0 {
+            let k = matched.trailing_zeros() as usize;
+            let ks = base + k * STRIDE;
+            let warm = warmup(src, ks, c.min, gear);
+            if let Some((cut, hh)) = scan_scalar(src, ks, ks + STRIDE, warm, center, &c, gear) {
                 return (hh, cut);
             }
         }
@@ -407,8 +415,8 @@ fn main() {
     // closures capturing the tables, all with signature (&[u8], Cfg)->(u64,usize)
     let roll = |s: &[u8], c: Cfg| cut_roll(s, c, g, gl);
     let gh = |s: &[u8], c: Cfg| cut_gearhash(s, c, g);
-    let s4 = |s: &[u8], c: Cfg| cut_strip::<4>(s, c, g);
-    let s8 = |s: &[u8], c: Cfg| cut_strip::<8>(s, c, g);
+    let s4 = |s: &[u8], c: Cfg| cut_strip_avx::<4>(s, c, g);
+    let s8 = |s: &[u8], c: Cfg| cut_strip_avx::<8>(s, c, g);
 
     const ROUNDS: usize = 41;
     const WARMUP: usize = 5;
